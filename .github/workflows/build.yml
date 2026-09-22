@@ -1,0 +1,159 @@
+# 构建跨平台可执行程序。
+#
+# 触发方式：
+#   - workflow_dispatch：手动跑，产物在 Actions 页面以 artifact 下载。
+#   - push v* 标签：构建并自动创建 GitHub Release，附带压缩包和 sha256 校验文件。
+#   - push master 分支：构建并上传 artifact（不发 Release）。
+#
+# 产物布局遵循 src/utils/ripgrep.rs 的 vendored ripgrep 约定：
+#   压缩包内 vendor/ripgrep/<平台目录>/rg 与可执行文件同级，程序启动时
+#   优先使用它做文件搜索（platform_dir 映射见 vendor_ripgrep_platform_dir）。
+#
+# 平台说明：
+#   - Windows x64 走 MSVC（runner 预装，无需 mingw）。ring/onig_sys/tree-sitter
+#     等含 C/汇编的依赖从 crates.io 构建，使用预生成对象文件，不需要 nasm。
+#   - Linux x64 在 ubuntu-22.04 上编译，产物依赖 glibc >= 2.35
+#     （Ubuntu 22.04+ / Debian 12+ / RHEL 9+）。如需更老的发行版，考虑
+#     x86_64-unknown-linux-musl（需 musl-gcc，各 C 依赖均可编译）。
+
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 打包进压缩包的 vendored ripgrep 版本（官方 release 资产已核对存在）。
+  RIPGREP_VERSION: "15.2.0"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 主力目标：Windows x64
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: cometix.exe
+            archive: cometix-windows-x64.zip
+            # ripgrep 的下载三元组与运行时查找目录（x64-win32 = ARCH x86_64 + OS windows）
+            rg_triple: x86_64-pc-windows-msvc
+            rg_platform_dir: x64-win32
+          # 顺带目标：Linux x64
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: cometix
+            archive: cometix-linux-x64.tar.gz
+            # ripgrep 取 musl 版：完全静态链接，不挑发行版
+            rg_triple: x86_64-unknown-linux-musl
+            rg_platform_dir: x64-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 项目声明 rust-version = 1.88（edition 2024）；stable 恒大于此。
+      # 需要可复现构建时可改成 @1.88。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 两个 job 同名（build），必须按 target 拆缓存，否则互相覆盖。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo build --release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rgUrl = "https://github.com/BurntSushi/ripgrep/releases/download/${env:RIPGREP_VERSION}/ripgrep-${env:RIPGREP_VERSION}-${{ matrix.rg_triple }}.zip"
+          $rgZip = "$env:RUNNER_TEMP/ripgrep.zip"
+          $rgDir = "$env:RUNNER_TEMP/ripgrep"
+          Invoke-WebRequest -Uri $rgUrl -OutFile $rgZip
+          Expand-Archive -Path $rgZip -DestinationPath $rgDir -Force
+
+          $stage = "dist/stage"
+          New-Item -ItemType Directory -Force "$stage/vendor/ripgrep/${{ matrix.rg_platform_dir }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $stage
+          Copy-Item LICENSE $stage
+          Copy-Item (Get-ChildItem $rgDir -Recurse -Filter rg.exe | Select-Object -First 1).FullName `
+            "$stage/vendor/ripgrep/${{ matrix.rg_platform_dir }}/rg.exe"
+
+          # 冒烟测试：--version 是零依赖 fast path，不会进入 TUI（src/entrypoints/cli.rs）。
+          & "$stage/${{ matrix.binary }}" --version
+
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/${{ matrix.archive }}" -Force
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          rgUrl="https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-${{ matrix.rg_triple }}.tar.gz"
+          rgDir="$RUNNER_TEMP/ripgrep"
+          mkdir -p "$rgDir" dist/stage
+          curl -fsSL "$rgUrl" | tar xz -C "$rgDir" --strip-components=1
+
+          mkdir -p "dist/stage/vendor/ripgrep/${{ matrix.rg_platform_dir }}"
+          install -m 755 "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/stage/${{ matrix.binary }}
+          install -m 644 LICENSE dist/stage/LICENSE
+          install -m 755 "$rgDir/rg" "dist/stage/vendor/ripgrep/${{ matrix.rg_platform_dir }}/rg"
+
+          # 冒烟测试：--version 是零依赖 fast path，不会进入 TUI（src/entrypoints/cli.rs）。
+          dist/stage/${{ matrix.binary }} --version
+
+          tar -czf "dist/${{ matrix.archive }}" -C dist/stage .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    # 仅标签触发时发布 Release；手动 workflow_dispatch 只产出 artifact。
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate sha256 checksums
+        run: |
+          cd dist
+          sha256sum cometix-*.zip cometix-*.tar.gz > sha256-checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+          generate_release_notes: true
