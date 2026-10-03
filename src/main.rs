@@ -11,7 +11,7 @@
 
 use crate::bootstrap;
 use crate::commands;
-use crate::components::spinner::SpinnerGlyph;
+use crate::components::spinner::Spinner;
 use crate::hooks::notifs::startup::startup_notifications;
 use crate::hooks::notifs::statusline::status_line_trust_blocked_notification;
 use crate::interactive_helpers::{
@@ -903,9 +903,6 @@ struct MainProps {
     session_launch: commands::resume::CliSessionLaunch,
     resume_filter_by_pr: Option<crate::screens::resume_conversation::ResumeFilterByPr>,
     mcp_startup: Arc<McpStartupConfig>,
-    /// Pre-render keybinding snapshot/runtime. Loading and watcher setup happen
-    /// before the retained root mounts.
-    keybinding_runtime: crate::keybindings::keybinding_context::KeybindingRuntime,
     /// Rust process adapter for CC `exitWithError(..., exitCode: 1)`.
     exit_code: Arc<AtomicI32>,
 }
@@ -924,8 +921,6 @@ impl Default for MainProps {
             session_launch: commands::resume::CliSessionLaunch::None,
             resume_filter_by_pr: None,
             mcp_startup: Arc::new(McpStartupConfig::default()),
-            keybinding_runtime:
-                crate::keybindings::keybinding_context::KeybindingRuntime::with_default_bindings(),
             exit_code: Arc::new(AtomicI32::new(0)),
         }
     }
@@ -998,11 +993,6 @@ fn Main(props: &MainProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     });
     // Keep all iocraft hooks above retained phase branching. React has the same
     // rule; violating it caused the bare `-r` loading→selector panic.
-    let keybinding_runtime = crate::keybindings::keybinding_provider_setup::use_keybinding_setup(
-        &mut hooks,
-        props.keybinding_runtime.clone(),
-    );
-    let current_theme = *crate::utils::theme::current();
 
     // Maps to: CC `main.tsx` awaiting `loadPluginHooks()` after setup and
     // before SessionStart/REPL launch. Registered hooks remain separate from
@@ -1087,7 +1077,7 @@ fn Main(props: &MainProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     } else if resolved_commands.read().is_none() || resolved_initial_tools.read().is_none() {
         element! {
             View(flex_direction: FlexDirection::Row) {
-                SpinnerGlyph(frame: 0usize)
+                Spinner
                 Text(content: " Loading commands…".to_string(), wrap: TextWrap::NoWrap)
             }
         }
@@ -1169,7 +1159,6 @@ fn Main(props: &MainProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             &mut hooks.use_context_mut::<SystemContext>(),
                             &props.exit_code,
                             error,
-                            current_theme.error,
                         )
                     } else {
                         if !resume_started.get() {
@@ -1258,7 +1247,7 @@ fn Main(props: &MainProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                         element! {
                             View(flex_direction: FlexDirection::Row) {
-                                SpinnerGlyph(frame: 0usize)
+                                Spinner
                                 Text(
                                     content: " Resuming conversation…".to_string(),
                                     wrap: TextWrap::NoWrap,
@@ -1280,16 +1269,19 @@ fn Main(props: &MainProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     // `state::app_state::AppStateProvider`, which is its sole provider.
     // The startup settings snapshot likewise travels as a typed prop
     // (`SetupScreensHostProps` / `AppProps`), so no ambient
-    // `Arc<SettingsWithErrors>` context is published either.
+    // `Arc<SettingsWithErrors>` context is published either. No keybinding
+    // runtime either: as in CC, each phase that takes keys mounts its own
+    // `KeybindingSetup` — REPL (REPL.tsx:5851, :6083), each setup dialog
+    // (interactiveHelpers.tsx:121-131) and the resume chooser
+    // (dialogLaunchers.tsx:171-196). The theme is CC's `ink.ts` wrap: every
+    // render sits under a ThemeProvider reading the configured setting.
     element! {
-        ContextProvider(value: Context::owned(keybinding_runtime)) {
-            ContextProvider(value: Context::owned(current_theme)) {
-                ContextProvider(value: Context::owned(clipboard.clone())) {
-                    // Node process.exitCode representation: reuse the existing
-                    // process-owned status consumed after the render loop.
-                    ContextProvider(value: Context::owned(props.exit_code.clone())) {
-                        #(phase)
-                    }
+        crate::components::design_system::theme_provider::ThemeProvider {
+            ContextProvider(value: Context::owned(clipboard.clone())) {
+                // Node process.exitCode representation: reuse the existing
+                // process-owned status consumed after the render loop.
+                ContextProvider(value: Context::owned(props.exit_code.clone())) {
+                    #(phase)
                 }
             }
         }
@@ -1576,13 +1568,11 @@ pub fn run(config: crate::cli::CliConfig) {
     }
     let setup_snapshot = Arc::new(default_setup_screens_snapshot());
 
-    // Maps to CC `loadKeybindingsSyncWithWarnings()` before the interactive
-    // provider mounts. Config reads never enter a retained frame.
-    let startup_keybindings =
-        crate::keybindings::load_user_bindings::load_keybindings_sync_with_warnings();
-    let keybinding_runtime = crate::keybindings::keybinding_context::KeybindingRuntime::new(
-        startup_keybindings.bindings.clone(),
-    );
+    // Maps to CC `loadKeybindingsSyncWithWarnings()` (loadUserBindings.ts,
+    // cached): the first load, done here so it fills the loader cache before
+    // anything mounts. Every `KeybindingSetup` then reads that cache, so no
+    // config read enters a retained frame.
+    let _ = crate::keybindings::load_user_bindings::load_keybindings_sync_with_warnings();
 
     let launch = match build_interactive_launch_with_system_prompts(
         &startup_settings.settings,
@@ -1618,12 +1608,9 @@ pub fn run(config: crate::cli::CliConfig) {
     //     re-seed.
     //   * `claude_ai_limits::bind_app_store` — permanently exempt (approved
     //     L1 `Compile-time distribution capability projection`).
-    //   * `sync_keybinding_warning_notification` + the watcher callback — CC
-    //     `KeybindingProviderSetup.tsx:68-104` runs inside the provider
-    //     (`REPL.tsx:182`). Kept here because the Rust keybinding runtime is
-    //     mounted by the retained root ABOVE the provider; the notification it
-    //     writes lands in the adopted root either way. SEAM: ownership差,
-    //     no observable difference at first paint.
+    //   * keybinding warnings — no longer written here: REPL's
+    //     `KeybindingSetup` mounts inside the provider and runs
+    //     `useKeybindingWarnings` itself (KeybindingProviderSetup.tsx:68-121).
     //   * settings watch — DELETED at G5; ownership moved to the provider
     //     subscription (`AppState.tsx:104-110`) with the detector as the
     //     process-wide notifier (`main.tsx:689`).
@@ -1662,23 +1649,11 @@ pub fn run(config: crate::cli::CliConfig) {
     // is dropped after the retained tree unmounts.
     let _claude_ai_limits_subscription =
         crate::services::claude_ai_limits::bind_app_store(store.clone());
-    crate::keybindings::keybinding_provider_setup::sync_keybinding_warning_notification(
-        &store,
-        &startup_keybindings.warnings,
-    );
-    // Maps to CC `initializeKeybindingWatcher()` + subscription. The watcher
-    // and all reload I/O live outside the retained tree.
-    let _keybinding_watcher = {
-        let runtime = keybinding_runtime.clone();
-        let store = store.clone();
-        crate::keybindings::load_user_bindings::initialize_keybinding_watcher(move |result| {
-            runtime.replace_bindings(result.bindings);
-            crate::keybindings::keybinding_provider_setup::sync_keybinding_warning_notification(
-                &store,
-                &result.warnings,
-            );
-        })
-    };
+    // Maps to CC `initializeKeybindingWatcher()` (loadUserBindings.ts:353-404),
+    // which CC starts from the first KeybindingSetup mount and keeps for the
+    // process. The watcher and all reload I/O live outside the retained tree;
+    // each `KeybindingSetup` mount subscribes to what it emits.
+    let _keybinding_watcher = crate::keybindings::load_user_bindings::initialize_keybinding_watcher();
 
     utils::debug::log_for_debugging(&format!(
         "[STARTUP] setup() completed in {}ms",
@@ -1696,36 +1671,102 @@ pub fn run(config: crate::cli::CliConfig) {
                 session_launch: session_launch.clone(),
                 resume_filter_by_pr: resume_filter_by_pr.clone(),
                 mcp_startup: mcp_startup.clone(),
-                keybinding_runtime: keybinding_runtime.clone(),
                 exit_code: exit_code.clone(),
             )
         }
         .into_any()
     };
 
-    if utils::debug::frame_profile_enabled() {
+    if utils::debug::frame_profile_enabled() || utils::debug::frame_timing_log_path().is_some() {
         let stats = Arc::new(Mutex::new(RenderFrameProfileStats::default()));
         let stats_for_callback = Arc::clone(&stats);
+        let profile_to_stderr = utils::debug::frame_profile_enabled();
+        // Maps to: CC `interactiveHelpers.tsx:427-450` — bench-only JSONL,
+        // same record shape (CC field names; sync append so no frames are
+        // dropped on abrupt exit) so one analysis script consumes both
+        // sides. Fields CC has and iocraft does not (optimize, patches,
+        // yogaVisited/CacheHits/Live) are omitted rather than faked;
+        // canvasHeight/changedCells/layoutMeasures are the Rust extras.
+        let mut timing_log = utils::debug::frame_timing_log_path().and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
         let render_result = rt.block_on(async {
             start_settings_change_detector();
+            // CC `createRoot(getBaseRenderOptions(false))` (main.tsx:6029,
+            // :6149): `exitOnCtrlC: false`, so a Ctrl+C no handler takes does
+            // nothing; exiting is the double press in useTextInput and
+            // useExitOnCtrlCD.
             let result = mount()
                 .render_loop()
+                .ignore_ctrl_c()
                 .stdout(utils::asciicast::RecordingStdout(std::io::stdout()))
                 .on_frame_profile(move |event| {
-                    eprintln!(
-                        "cometix-frame duration={:?} update={:?} layout={:?} draw={:?} repaint_check={:?} write={:?} canvas={}x{} changed_cells={} diff_rows={} repaint={:?}",
-                        event.duration,
-                        event.phases.update,
-                        event.phases.layout,
-                        event.phases.draw,
-                        event.phases.repaint_check,
-                        event.phases.terminal_write,
-                        event.phases.canvas_width,
-                        event.phases.canvas_height,
-                        event.phases.changed_cells,
-                        event.phases.diff_rows_scanned,
-                        event.repaint.as_ref().map(|repaint| repaint.reason),
-                    );
+                    if profile_to_stderr {
+                        eprintln!(
+                            "cometix-frame duration={:?} update={:?} layout={:?} draw={:?} repaint_check={:?} write={:?} canvas={}x{} changed_cells={} diff_rows={} measures={} repaint={:?}",
+                            event.duration,
+                            event.phases.update,
+                            event.phases.layout,
+                            event.phases.draw,
+                            event.phases.repaint_check,
+                            event.phases.terminal_write,
+                            event.phases.canvas_width,
+                            event.phases.canvas_height,
+                            event.phases.changed_cells,
+                            event.phases.diff_rows_scanned,
+                            event.phases.layout_measures,
+                            event.repaint.as_ref().map(|repaint| repaint.reason),
+                        );
+                    }
+                    if let Some(file) = timing_log.as_mut() {
+                        use std::io::Write as _;
+                        let millis = |duration: std::time::Duration| duration.as_secs_f64() * 1e3;
+                        // CC gates the expensive rss/cpu samples behind
+                        // CLAUDE_CODE_FRAME_TIMING_SAMPLE_EVERY; mirror it so
+                        // long captures can trade sample density for overhead.
+                        let sample = utils::debug::frame_timing_sample_tick();
+                        let mut line = serde_json::json!({
+                            // CC records `at: Date.now()`; frame cadence
+                            // (inter-frame gaps) is read off this field.
+                            "at": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                            "total": millis(event.duration),
+                            "commit": millis(event.phases.update),
+                            "yoga": millis(event.phases.layout),
+                            "renderer": millis(event.phases.draw),
+                            "diff": millis(event.phases.repaint_check),
+                            "cellScan": millis(event.phases.changed_cell_scan),
+                            "write": millis(event.phases.terminal_write),
+                            "taffyMeasured": event.phases.layout_measures,
+                            "taffyLive": event.phases.layout_nodes,
+                            "eventSnapshot": millis(event.phases.event_snapshot),
+                            "canvasAlloc": millis(event.phases.canvas_alloc),
+                            "canvasSwap": millis(event.phases.canvas_swap),
+                            "syncWrap": millis(event.phases.sync_wrap),
+                            "settleRounds": event.phases.settle_rounds,
+                            "diffRows": event.phases.diff_rows_scanned,
+                            "canvasWidth": event.phases.canvas_width,
+                            "canvasHeight": event.phases.canvas_height,
+                            "changedCells": event.phases.changed_cells,
+                        });
+                        if sample {
+                            let (cpu_user, cpu_system) =
+                                utils::debug::process_cpu_usage_micros();
+                            line["rss"] = serde_json::json!(
+                                crate::hooks::use_memory_usage::process_rss_bytes()
+                            );
+                            line["cpu"] = serde_json::json!(
+                                {"user": cpu_user, "system": cpu_system}
+                            );
+                        }
+                        let _ = writeln!(file, "{line}");
+                    }
                     stats_for_callback.lock().unwrap().record(&event);
                 })
                 .await;
@@ -1770,8 +1811,10 @@ pub fn run(config: crate::cli::CliConfig) {
     } else {
         let render_result = rt.block_on(async {
             start_settings_change_detector();
+            // `exitOnCtrlC: false`, as above.
             let result = mount()
                 .render_loop()
+                .ignore_ctrl_c()
                 .stdout(utils::asciicast::RecordingStdout(std::io::stdout()))
                 .await;
             if let Err(error) = crate::cost_tracker::save_current_session_costs() {
@@ -2097,7 +2140,6 @@ mod tests {
             oauth_enabled: false,
             api_key_needing_approval: None,
             offer_terminal_setup: false,
-            theme_name: Some(utils::theme::ThemeName::Dark),
             terminal_name: Some("kitty".to_string()),
             show_claude_in_chrome_onboarding: false,
             claude_in_chrome_extension_installed: false,
